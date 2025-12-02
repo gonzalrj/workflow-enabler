@@ -1,4 +1,4 @@
-name: Trigger remote regression and fetch reports
+name: Trigger remote regression and link to report
 
 on:
   push:
@@ -14,239 +14,120 @@ env:
   TIMEOUT_MINUTES: 30
 
 jobs:
-  trigger-and-wait:
+  trigger-remote:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install jq (for JSON parsing)
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
 
       - name: Dispatch remote workflow via REST
         id: dispatch
         env:
-          OWNER: ${{ env.REMOTE_OWNER }}
-          REPO: ${{ env.REMOTE_REPO }}
-          WORKFLOW: ${{ env.REMOTE_WORKFLOW_FILE }}
-          REF: ${{ env.REMOTE_BRANCH }}
           PAT: ${{ secrets.REMOTE_PAT }}
         run: |
           set -euo pipefail
-          echo "Dispatching workflow ${WORKFLOW} on ${OWNER}/${REPO} -> ref=${REF}"
-          payload=$(jq -n --arg r "${REF}" '{ref: $r}')
-          # curl writes body to stderr with -sS -o /dev/stderr; http code captured in $http_status
-          http_status=$(curl -sS -o /dev/stderr -w "%{http_code}" -X POST \
+          echo "Triggering remote workflow..."
+
+          payload=$(jq -n --arg ref "${REMOTE_BRANCH}" '{ref: $ref}')
+          status=$(curl -sS -o /dev/stderr -w "%{http_code}" \
+            -X POST \
             -H "Authorization: token ${PAT}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/dispatches" \
-            -d "${payload}" ) || true
+            "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/workflows/${REMOTE_WORKFLOW_FILE}/dispatches" \
+            -d "${payload}")
 
-          echo "Dispatch HTTP status: $http_status"
-          if [ "$http_status" != "204" ]; then
-            echo "Dispatch failed (status $http_status). Ensure REMOTE_PAT has repo+workflow scopes, remote workflow has 'on: workflow_dispatch', and owner/repo/workflow names are correct."
+          if [ "$status" != "204" ]; then
+            echo "Failed to trigger workflow. HTTP $status"
             exit 1
           fi
-          echo "Dispatched successfully."
 
-      - name: Poll for remote workflow run id and wait for completion
+          echo "Remote workflow dispatched."
+
+      - name: Poll for remote workflow to start and finish
         id: poll
         env:
-          OWNER: ${{ env.REMOTE_OWNER }}
-          REPO: ${{ env.REMOTE_REPO }}
-          WORKFLOW: ${{ env.REMOTE_WORKFLOW_FILE }}
-          REF: ${{ env.REMOTE_BRANCH }}
           PAT: ${{ secrets.REMOTE_PAT }}
-          POLL_INTERVAL: ${{ env.POLL_INTERVAL_SECONDS }}
-          TIMEOUT: ${{ env.TIMEOUT_MINUTES }}
         run: |
           set -euo pipefail
-          poll_interval=${POLL_INTERVAL}
-          timeout_seconds=$(( TIMEOUT * 60 ))
-          start_ts=$(date +%s)
-          echo "Waiting up to ${TIMEOUT} minutes for remote run to appear and complete..."
+
+          poll_interval=${POLL_INTERVAL_SECONDS}
+          timeout_seconds=$(( TIMEOUT_MINUTES * 60 ))
+          start=$(date +%s)
+
+          echo "Waiting for remote run to appear..."
 
           run_id=""
-          # Wait for the new run to appear (take the most recent run for that workflow+branch)
-          while true; do
+
+          while [ -z "$run_id" ]; do
+            response=$(curl -sS \
+              -H "Authorization: token ${PAT}" \
+              "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/workflows/${REMOTE_WORKFLOW_FILE}/runs?branch=${REMOTE_BRANCH}&event=workflow_dispatch&per_page=1")
+
+            run_id=$(echo "$response" | jq -r '.workflow_runs[0].id // empty')
+
+            [ -n "$run_id" ] && break
+
             now=$(date +%s)
-            elapsed=$(( now - start_ts ))
-            if [ $elapsed -ge $timeout_seconds ]; then
-              echo "Timed out waiting for remote run to appear (after ${TIMEOUT} minutes)."
-              exit 2
-            fi
-
-            runs_resp=$(curl -sS -H "Authorization: token ${PAT}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/runs?branch=${REF}&event=workflow_dispatch&per_page=5")
-
-            run_id=$(echo "$runs_resp" | jq -r '.workflow_runs[0].id // empty')
-            run_created_at=$(echo "$runs_resp" | jq -r '.workflow_runs[0].created_at // empty')
-            run_status=$(echo "$runs_resp" | jq -r '.workflow_runs[0].status // empty')
-            run_conclusion=$(echo "$runs_resp" | jq -r '.workflow_runs[0].conclusion // empty')
-
-            if [ -n "$run_id" ]; then
-              echo "Found run: id=$run_id created_at=$run_created_at status=$run_status conclusion=$run_conclusion"
-              break
-            fi
+            [ $((now - start)) -gt $timeout_seconds ] && exit 1
 
             sleep $poll_interval
           done
 
-          # Wait for completion
+          echo "Remote run ID: $run_id"
+          echo "run_id=$run_id" >> $GITHUB_OUTPUT
+
+          echo "Waiting for remote run to finish..."
+
           while true; do
-            now=$(date +%s)
-            elapsed=$(( now - start_ts ))
-            if [ $elapsed -ge $timeout_seconds ]; then
-              echo "Timed out waiting for remote run to finish (after ${TIMEOUT} minutes)."
-              exit 2
-            fi
+            run_json=$(curl -sS \
+              -H "Authorization: token ${PAT}" \
+              "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}")
 
-            run_resp=$(curl -sS -H "Authorization: token ${PAT}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${run_id}")
+            status=$(echo "$run_json" | jq -r '.status')
+            conclusion=$(echo "$run_json" | jq -r '.conclusion')
 
-            status=$(echo "$run_resp" | jq -r '.status // empty')
-            conclusion=$(echo "$run_resp" | jq -r '.conclusion // empty')
-            echo "Remote run id=${run_id} status=${status} conclusion=${conclusion}"
+            echo "Status: $status | Conclusion: $conclusion"
 
             if [ "$status" = "completed" ]; then
-              echo "Remote run completed with conclusion=${conclusion}"
-              echo "RUN_ID=${run_id}" >> $GITHUB_OUTPUT
-              echo "RUN_CONCLUSION=${conclusion}" >> $GITHUB_OUTPUT
+              echo "conclusion=$conclusion" >> $GITHUB_OUTPUT
               break
             fi
+
+            now=$(date +%s)
+            [ $((now - start)) -gt $timeout_seconds ] && exit 1
 
             sleep $poll_interval
           done
 
-      - name: Download remote artifacts (if successful)
-        if: ${{ steps.poll.outputs.RUN_CONCLUSION == 'success' }}
-        env:
-          OWNER: ${{ env.REMOTE_OWNER }}
-          REPO: ${{ env.REMOTE_REPO }}
-          PAT: ${{ secrets.REMOTE_PAT }}
-          RUN_ID: ${{ steps.poll.outputs.RUN_ID }}
+      - name: Output direct links to remote run & artifacts
+        id: links
         run: |
-          set -euo pipefail
-          echo "Fetching artifacts for run ${RUN_ID}..."
-          artifacts_json=$(curl -sS -H "Authorization: token ${PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts")
+          run_id="${{ steps.poll.outputs.run_id }}"
+          echo ""
+          echo "===================="
+          echo "  REMOTE RUN LINKS"
+          echo "===================="
+          echo "Remote Run URL:"
+          echo "https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}"
+          echo ""
+          echo "Artifacts URL (Allure report, zipped):"
+          echo "https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts"
+          echo ""
+          echo "===================="
 
-          total=$(echo "$artifacts_json" | jq -r '.total_count // 0')
-          echo "Artifact total_count = $total"
-          if [ "$total" -eq 0 ]; then
-            echo "No artifacts to download."
-            exit 0
-          fi
+          # expose as workflow outputs
+          echo "remote_run_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}" >> $GITHUB_OUTPUT
+          echo "remote_artifacts_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts" >> $GITHUB_OUTPUT
 
-          mkdir -p remote_artifacts
-          for id in $(echo "$artifacts_json" | jq -r '.artifacts[].id'); do
-            name=$(echo "$artifacts_json" | jq -r ".artifacts[] | select(.id==${id}) | .name")
-            echo "Downloading artifact id=$id name=$name"
-            curl -sSL -H "Authorization: token ${PAT}" \
-              -H "Accept: application/octet-stream" \
-              "https://api.github.com/repos/${OWNER}/${REPO}/actions/artifacts/${id}/zip" \
-              --output "remote_artifacts/${name}_${id}.zip"
-          done
-
-      - name: Prepare final Allure report (merge/unpack & generate)
-        if: ${{ always() }}
-        env:
-          PAT: ${{ secrets.REMOTE_PAT }}
+      - name: Mark job as failed if remote workflow failed
+        if: ${{ steps.poll.outputs.conclusion != 'success' }}
         run: |
-          set -euo pipefail
-          # where remote zips were saved
-          mkdir -p artifacts_unzipped merged-allure-results final-allure-report
-          echo "Unzipping remote artifact zips..."
-          for z in remote_artifacts/*.zip; do
-            echo "Unzipping $z..."
-            unzip -qq -o "$z" -d artifacts_unzipped/ || true
-          done
+          echo "Remote workflow FAILED."
+          exit 1
 
-          # Find any allure-results directories (sharded results)
-          mapfile -t results_dirs < <(find artifacts_unzipped -type d -name "allure-results" || true)
-          echo "Found allure-results dirs: ${results_dirs[@]:-none}"
-
-          if [ ${#results_dirs[@]} -gt 0 ]; then
-            echo "Merging allure-results into merged-allure-results/"
-            rm -rf merged-allure-results/*
-            mkdir -p merged-allure-results
-            for d in "${results_dirs[@]}"; do
-              echo "Copying from $d"
-              cp -R "$d"/. merged-allure-results/ || true
-            done
-
-            # Install node + allure-commandline if needed
-            echo "Installing Node/npm (if missing) and allure-commandline..."
-            if ! command -v node >/dev/null 2>&1; then
-              echo "Node not found — installing nodejs and npm via apt..."
-              sudo apt-get update -y
-              sudo apt-get install -y curl ca-certificates gnupg
-              curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-              sudo apt-get install -y nodejs
-            fi
-
-            # install allure-cli globally (choose a pinned version if you want)
-            if ! command -v allure >/dev/null 2>&1; then
-              npm install -g allure-commandline@2.13.10 --no-audit --no-fund
-            fi
-
-            echo "Generating Allure HTML report from merged results..."
-            rm -rf final-allure-report/*
-            allure generate merged-allure-results -o final-allure-report --clean
-            if [ ! -d final-allure-report ] || [ -z "$(ls -A final-allure-report 2>/dev/null)" ]; then
-              echo "Allure generate failed or produced empty report. Contents of merged-allure-results:"
-              ls -la merged-allure-results || true
-              exit 1
-            fi
-          else
-            echo "No allure-results found. Looking for already-generated reports (index.html)..."
-            # Find directories that contain index.html at top level (or named allure-report / allure-reports)
-            mapfile -t report_dirs < <(find artifacts_unzipped -type f -name "index.html" -printf '%h\n' | sort -u || true)
-            # also include folders named allure-report or allure-reports
-            mapfile -t extra_dirs < <(find artifacts_unzipped -type d -iname "allure-report*" -print || true)
-            report_dirs+=("${extra_dirs[@]}")
-            # pick first non-empty candidate
-            chosen=""
-            for d in "${report_dirs[@]}"; do
-              if [ -n "$d" ] && [ -f "$d/index.html" ]; then
-                chosen="$d"
-                break
-              fi
-            done
-
-            if [ -n "$chosen" ]; then
-              echo "Using existing generated report at: $chosen"
-              rm -rf final-allure-report/*
-              mkdir -p final-allure-report
-              cp -R "$chosen"/. final-allure-report/
-            else
-              echo "No pre-generated Allure report found and no allure-results found. Listing artifacts_unzipped:"
-              find artifacts_unzipped -maxdepth 3 -type f -print || true
-              # still create an empty folder so upload step doesn't fail
-              mkdir -p final-allure-report
-            fi
-          fi
-
-          # zip the final report so we have a consistent artifact format
-          echo "Zipping final report to final-allure-report.zip"
-          rm -f final-allure-report.zip
-          (cd final-allure-report && zip -r ../final-allure-report.zip .) || true
-          ls -la final-allure-report.zip || true
-
-          # move into upload location
-          mkdir -p final_upload
-          mv final-allure-report.zip final_upload/ || true
-
-      - name: Upload final Allure report zip
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-allure-report
-          path: final_upload/final-allure-report.zip
-      
-      - name: Upload remote artifacts so they can be downloaded from this run
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: remote-artifacts
-          path: remote_artifacts/*.zip
+      - name: Mark job as success if remote passed
+        if: ${{ steps.poll.outputs.conclusion == 'success' }}
+        run: |
+          echo "Remote workflow succeeded."
+          echo "Click link above to download Allure report."
