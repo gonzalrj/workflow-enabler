@@ -148,6 +148,102 @@ jobs:
               --output "remote_artifacts/${name}_${id}.zip"
           done
 
+      - name: Prepare final Allure report (merge/unpack & generate)
+        if: ${{ always() }}
+        env:
+          PAT: ${{ secrets.REMOTE_PAT }}
+        run: |
+          set -euo pipefail
+          # where remote zips were saved
+          mkdir -p artifacts_unzipped merged-allure-results final-allure-report
+          echo "Unzipping remote artifact zips..."
+          for z in remote_artifacts/*.zip; do
+            echo "Unzipping $z..."
+            unzip -qq -o "$z" -d artifacts_unzipped/ || true
+          done
+
+          # Find any allure-results directories (sharded results)
+          mapfile -t results_dirs < <(find artifacts_unzipped -type d -name "allure-results" || true)
+          echo "Found allure-results dirs: ${results_dirs[@]:-none}"
+
+          if [ ${#results_dirs[@]} -gt 0 ]; then
+            echo "Merging allure-results into merged-allure-results/"
+            rm -rf merged-allure-results/*
+            mkdir -p merged-allure-results
+            for d in "${results_dirs[@]}"; do
+              echo "Copying from $d"
+              cp -R "$d"/. merged-allure-results/ || true
+            done
+
+            # Install node + allure-commandline if needed
+            echo "Installing Node/npm (if missing) and allure-commandline..."
+            if ! command -v node >/dev/null 2>&1; then
+              echo "Node not found — installing nodejs and npm via apt..."
+              sudo apt-get update -y
+              sudo apt-get install -y curl ca-certificates gnupg
+              curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+
+            # install allure-cli globally (choose a pinned version if you want)
+            if ! command -v allure >/dev/null 2>&1; then
+              npm install -g allure-commandline@2.13.10 --no-audit --no-fund
+            fi
+
+            echo "Generating Allure HTML report from merged results..."
+            rm -rf final-allure-report/*
+            allure generate merged-allure-results -o final-allure-report --clean
+            if [ ! -d final-allure-report ] || [ -z "$(ls -A final-allure-report 2>/dev/null)" ]; then
+              echo "Allure generate failed or produced empty report. Contents of merged-allure-results:"
+              ls -la merged-allure-results || true
+              exit 1
+            fi
+          else
+            echo "No allure-results found. Looking for already-generated reports (index.html)..."
+            # Find directories that contain index.html at top level (or named allure-report / allure-reports)
+            mapfile -t report_dirs < <(find artifacts_unzipped -type f -name "index.html" -printf '%h\n' | sort -u || true)
+            # also include folders named allure-report or allure-reports
+            mapfile -t extra_dirs < <(find artifacts_unzipped -type d -iname "allure-report*" -print || true)
+            report_dirs+=("${extra_dirs[@]}")
+            # pick first non-empty candidate
+            chosen=""
+            for d in "${report_dirs[@]}"; do
+              if [ -n "$d" ] && [ -f "$d/index.html" ]; then
+                chosen="$d"
+                break
+              fi
+            done
+
+            if [ -n "$chosen" ]; then
+              echo "Using existing generated report at: $chosen"
+              rm -rf final-allure-report/*
+              mkdir -p final-allure-report
+              cp -R "$chosen"/. final-allure-report/
+            else
+              echo "No pre-generated Allure report found and no allure-results found. Listing artifacts_unzipped:"
+              find artifacts_unzipped -maxdepth 3 -type f -print || true
+              # still create an empty folder so upload step doesn't fail
+              mkdir -p final-allure-report
+            fi
+          fi
+
+          # zip the final report so we have a consistent artifact format
+          echo "Zipping final report to final-allure-report.zip"
+          rm -f final-allure-report.zip
+          (cd final-allure-report && zip -r ../final-allure-report.zip .) || true
+          ls -la final-allure-report.zip || true
+
+          # move into upload location
+          mkdir -p final_upload
+          mv final-allure-report.zip final_upload/ || true
+
+      - name: Upload final Allure report zip
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-allure-report
+          path: final_upload/final-allure-report.zip
+      
       - name: Upload remote artifacts so they can be downloaded from this run
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
