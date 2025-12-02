@@ -1,4 +1,4 @@
-name: Trigger QA Practice workflow
+name: Trigger remote regression (and fetch reports)
 
 on:
   push:
@@ -6,18 +6,145 @@ on:
       - main
 
 jobs:
-  trigger-qa-workflow:
+  trigger-and-wait:
     runs-on: ubuntu-latest
+    env:
+      REMOTE_OWNER: gonzalrj
+      REMOTE_REPO: qa-practice-swaglabs
+      REMOTE_WORKFLOW_FILE: manual-regression-sharded.yml
+      REMOTE_BRANCH: main
+      POLL_INTERVAL_SECONDS: 10
+      TIMEOUT_MINUTES: 30
+
     steps:
-      - name: Trigger remote workflow (workflow_dispatch)
-        env:
-          TARGET_OWNER: gonzalrj
-          TARGET_REPO: qa-practice-swaglabs
-          TARGET_WORKFLOW_FILE: manual-regression-sharded.yml
+      - name: Trigger remote workflow dispatch
+        uses: peter-evans/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.REMOTE_PAT }}
+          repository: ${{ env.REMOTE_OWNER }}/${{ env.REMOTE_REPO }}
+          workflow: ${{ env.REMOTE_WORKFLOW_FILE }}
+          ref: ${{ env.REMOTE_BRANCH }}
+          # If your remote workflow accepts inputs, you can add them as `inputs:` here.
+      
+      - name: Wait for remote workflow run to start & complete
+        # uses bash + GitHub REST API + jq to poll the remote workflow run status
         run: |
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.TRIGGER_PAT }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/$TARGET_OWNER/$TARGET_REPO/actions/workflows/$TARGET_WORKFLOW_FILE/dispatches \
-            -d '{"ref":"main"}'
+          set -eo pipefail
+          PAT="${{ secrets.REMOTE_PAT }}"
+          owner="${REMOTE_OWNER}"
+          repo="${REMOTE_REPO}"
+          workflow_file="${REMOTE_WORKFLOW_FILE}"
+          branch="${REMOTE_BRANCH}"
+          poll_interval=${POLL_INTERVAL_SECONDS}
+          timeout=$(( TIMEOUT_MINUTES * 60 ))
+          start_time=$(date +%s)
+
+          echo "Polling for workflow run for ${owner}/${repo} workflow=${workflow_file} branch=${branch}"
+
+          # Find the most recent workflow run for that workflow triggered by workflow_dispatch or push on branch
+          run_id=""
+          while true; do
+            # grab latest run for the workflow on that branch
+            resp=$(curl -s -H "Authorization: token $PAT" \
+              "https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow_file}/runs?branch=${branch}&event=workflow_dispatch")
+            run_id=$(echo "$resp" | jq -r '.workflow_runs[0].id // empty')
+            status=$(echo "$resp" | jq -r '.workflow_runs[0].status // empty')
+            conclusion=$(echo "$resp" | jq -r '.workflow_runs[0].conclusion // empty')
+
+            if [ -n "$run_id" ]; then
+              echo "Found run_id=$run_id status=$status conclusion=$conclusion"
+              break
+            fi
+
+            now=$(date +%s)
+            elapsed=$(( now - start_time ))
+            if [ $elapsed -ge $timeout ]; then
+              echo "Timed out waiting for remote run to appear after ${TIMEOUT_MINUTES} minutes"
+              exit 2
+            fi
+
+            sleep $poll_interval
+          done
+
+          # wait until completed
+          while true; do
+            resp=$(curl -s -H "Authorization: token $PAT" \
+              "https://api.github.com/repos/${owner}/${repo}/actions/runs/${run_id}")
+            status=$(echo "$resp" | jq -r '.status // empty')
+            conclusion=$(echo "$resp" | jq -r '.conclusion // empty')
+            echo "run_id=${run_id} status=${status} conclusion=${conclusion}"
+
+            if [ "$status" = "completed" ]; then
+              echo "Remote run completed with conclusion=${conclusion}"
+              echo "RUN_ID=${run_id}" >> $GITHUB_OUTPUT
+              echo "RUN_CONCLUSION=${conclusion}" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            now=$(date +%s)
+            elapsed=$(( now - start_time ))
+            if [ $elapsed -ge $timeout ]; then
+              echo "Timed out waiting for remote run to finish after ${TIMEOUT_MINUTES} minutes"
+              exit 2
+            fi
+
+            sleep $poll_interval
+          done
+        shell: bash
+
+      - name: Set output vars from previous step
+        id: result
+        run: |
+          # values set to GITHUB_OUTPUT in the previous step; read them
+          echo "run_id=$RUN_ID"
+          echo "conclusion=$RUN_CONCLUSION"
+        env:
+          RUN_ID: ${{ steps.trigger-and-wait.outputs.RUN_ID }}
+          RUN_CONCLUSION: ${{ steps.trigger-and-wait.outputs.RUN_CONCLUSION }}
+
+      - name: Decide pass/fail and (if success) download artifacts
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          PAT="${{ secrets.REMOTE_PAT }}"
+          owner="${REMOTE_OWNER}"
+          repo="${REMOTE_REPO}"
+          run_id="${{ steps.trigger-and-wait.outputs.RUN_ID }}"
+          conclusion="${{ steps.trigger-and-wait.outputs.RUN_CONCLUSION }}"
+
+          echo "Remote run ${run_id} conclusion=${conclusion}"
+
+          if [ "${conclusion}" != "success" ]; then
+            echo "Remote workflow did not succeed (conclusion=${conclusion}). Marking job as failed."
+            # Fail the job to reflect failure for the overall workflow (you can change behavior)
+            exit 1
+          fi
+
+          echo "Remote workflow succeeded — fetching artifacts..."
+          # List artifacts for the run
+          artifacts_json=$(curl -s -H "Authorization: token $PAT" \
+            "https://api.github.com/repos/${owner}/${repo}/actions/runs/${run_id}/artifacts")
+          artifact_count=$(echo "$artifacts_json" | jq -r '.total_count')
+
+          if [ "$artifact_count" -eq 0 ]; then
+            echo "No artifacts found for remote run ${run_id}"
+            exit 0
+          fi
+
+          mkdir -p remote_artifacts
+          for id in $(echo "$artifacts_json" | jq -r '.artifacts[].id'); do
+            name=$(echo "$artifacts_json" | jq -r ".artifacts[] | select(.id==${id}) | .name")
+            echo "Downloading artifact id=$id name=$name"
+            # Download zip of artifact
+            curl -L -s -H "Authorization: token $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${owner}/${repo}/actions/artifacts/${id}/zip" \
+              --output "remote_artifacts/${name}_${id}.zip"
+          done
+
+      - name: Upload remote artifacts so they can be downloaded from this run
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-artifacts
+          path: remote_artifacts/*.zip
