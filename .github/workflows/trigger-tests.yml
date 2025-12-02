@@ -1,4 +1,4 @@
-name: Trigger remote regression and link to report (robust)
+name: Trigger remote regression and link to report (robust run detection)
 
 on:
   push:
@@ -11,7 +11,7 @@ env:
   REMOTE_WORKFLOW_FILE: manual-regression-sharded.yml
   REMOTE_BRANCH: main
   POLL_INTERVAL_SECONDS: 10
-  TIMEOUT_MINUTES: 60   # increased timeout (tweak as needed)
+  TIMEOUT_MINUTES: 90
 
 jobs:
   trigger-remote:
@@ -21,122 +21,146 @@ jobs:
       - name: Install jq
         run: sudo apt-get update -y && sudo apt-get install -y jq
 
+      - name: Record trigger timestamp (UTC)
+        id: ts
+        run: |
+          echo "trigger_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
       - name: Dispatch remote workflow via REST
         id: dispatch
         env:
           PAT: ${{ secrets.REMOTE_PAT }}
         run: |
           set -euo pipefail
-          echo "Triggering remote workflow..."
+          echo "Dispatching remote workflow ${REMOTE_WORKFLOW_FILE} -> ${REMOTE_OWNER}/${REMOTE_REPO}@${REMOTE_BRANCH}"
           payload=$(jq -n --arg ref "${REMOTE_BRANCH}" '{ref: $ref}')
-          status=$(curl -sS -o /dev/stderr -w "%{http_code}" \
-            -X POST \
+          http_status=$(curl -sS -o /dev/stderr -w "%{http_code}" -X POST \
             -H "Authorization: token ${PAT}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/workflows/${REMOTE_WORKFLOW_FILE}/dispatches" \
-            -d "${payload}")
-          if [ "$status" != "204" ]; then
-            echo "Failed to trigger workflow. HTTP $status"
+            -d "${payload}" ) || true
+
+          echo "Dispatch HTTP status: ${http_status}"
+          if [ "${http_status}" != "204" ]; then
+            echo "Failed to dispatch remote workflow (HTTP ${http_status}). Ensure REMOTE_PAT has repo+workflow scopes and remote workflow has 'on: workflow_dispatch'."
             exit 1
           fi
-          echo "Remote workflow dispatched."
+          echo "Dispatched successfully."
 
-      - name: Poll for remote run and wait for completion
-        id: poll
+      - name: Find the NEW run triggered by this workflow (epoch compare)
+        id: findrun
         env:
           PAT: ${{ secrets.REMOTE_PAT }}
+          TRIGGER_TS: ${{ steps.ts.outputs.trigger_ts }}
+          POLL_INTERVAL_SECONDS: ${{ env.POLL_INTERVAL_SECONDS }}
+          TIMEOUT_MINUTES: ${{ env.TIMEOUT_MINUTES }}
         run: |
           set -euo pipefail
+          echo "Looking for a run created at or after $TRIGGER_TS (1s tolerance)"
 
-          poll_interval=${POLL_INTERVAL_SECONDS}
-          timeout_seconds=$(( TIMEOUT_MINUTES * 60 ))
-          started_at=$(date +%s)
+          # convert trigger timestamp to epoch seconds
+          trigger_epoch=$(date -u -d "${TRIGGER_TS}" +%s)
+          echo "trigger_epoch=${trigger_epoch}"
 
-          echo "Looking for the newly-created run for workflow '${REMOTE_WORKFLOW_FILE}' on branch '${REMOTE_BRANCH}'..."
+          timeout=$(( TIMEOUT_MINUTES * 60 ))
+          start_ts=$(date +%s)
 
           run_id=""
-          # Keep trying until we find a run (respect timeout)
           while [ -z "$run_id" ]; do
             now=$(date +%s)
-            if [ $((now - started_at)) -ge $timeout_seconds ]; then
-              echo "Timed out waiting for remote run to appear after ${TIMEOUT_MINUTES} minutes."
-              # exit non-zero to fail early — change behavior if you prefer different handling
+            if [ $(( now - start_ts )) -gt $timeout ]; then
+              echo "Timed out waiting for new run to appear after ${TIMEOUT_MINUTES} minutes."
               exit 2
             fi
 
-            runs_resp=$(curl -sS -H "Authorization: token ${PAT}" \
-              "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/workflows/${REMOTE_WORKFLOW_FILE}/runs?branch=${REMOTE_BRANCH}&event=workflow_dispatch&per_page=5")
+            # fetch recent runs
+            runs_json=$(curl -sS -H "Authorization: token ${PAT}" \
+              "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/workflows/${REMOTE_WORKFLOW_FILE}/runs?branch=${REMOTE_BRANCH}&per_page=30")
 
-            run_id=$(echo "$runs_resp" | jq -r '.workflow_runs[0].id // empty')
-            if [ -n "$run_id" ]; then
-              echo "Found run id=$run_id"
+            # iterate and pick first run whose created_at epoch >= trigger_epoch - 1
+            run_id_candidate=$(echo "$runs_json" | jq -r '.workflow_runs[] | "\(.id) \(.created_at)"' | while read -r id created_at; do
+              # convert run created_at to epoch (ignore if conversion fails)
+              run_epoch=$(date -u -d "${created_at}" +%s 2>/dev/null || echo 0)
+              if [ "$run_epoch" -ge $(( trigger_epoch - 1 )) ]; then
+                echo "$id"
+                break
+              fi
+            done)
+
+            if [ -n "$run_id_candidate" ]; then
+              run_id="$run_id_candidate"
+              echo "Found new run ID: $run_id"
+              echo "run_id=${run_id}" >> $GITHUB_OUTPUT
               break
             fi
 
-            echo "No run yet; sleeping ${poll_interval}s..."
-            sleep "$poll_interval"
+            echo "No new run found yet; sleeping ${POLL_INTERVAL_SECONDS}s..."
+            sleep "${POLL_INTERVAL_SECONDS}"
           done
 
-          echo "Waiting for run ${run_id} to reach completed status..."
-          # Poll until this particular run reaches completed
+      - name: Wait for the run to finish (tracks the run we found)
+        id: wait
+        env:
+          PAT: ${{ secrets.REMOTE_PAT }}
+          RUN_ID: ${{ steps.findrun.outputs.run_id }}
+          POLL_INTERVAL_SECONDS: ${{ env.POLL_INTERVAL_SECONDS }}
+          TIMEOUT_MINUTES: ${{ env.TIMEOUT_MINUTES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RUN_ID}" ]; then
+            echo "No run id provided; aborting."
+            exit 1
+          fi
+          echo "Tracking run ${RUN_ID} until completion..."
+
+          timeout=$(( TIMEOUT_MINUTES * 60 ))
+          start_ts=$(date +%s)
+
           while true; do
             now=$(date +%s)
-            if [ $((now - started_at)) -ge $timeout_seconds ]; then
-              echo "Timed out waiting for run ${run_id} to finish after ${TIMEOUT_MINUTES} minutes."
+            if [ $(( now - start_ts )) -gt $timeout ]; then
+              echo "Timed out waiting for run ${RUN_ID} to finish after ${TIMEOUT_MINUTES} minutes."
               exit 3
             fi
 
-            run_resp=$(curl -sS -H "Authorization: token ${PAT}" \
-              "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}")
+            run_json=$(curl -sS -H "Authorization: token ${PAT}" \
+              "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${RUN_ID}")
 
-            status=$(echo "$run_resp" | jq -r '.status // empty')
-            conclusion=$(echo "$run_resp" | jq -r '.conclusion // empty')
+            status=$(echo "$run_json" | jq -r '.status // ""')
+            conclusion=$(echo "$run_json" | jq -r '.conclusion // ""')
 
-            echo "run_id=${run_id} status=${status} conclusion=${conclusion}"
+            echo "run_id=${RUN_ID} status=${status} conclusion=${conclusion}"
 
-            if [ "$status" = "completed" ]; then
-              echo "Remote run completed with conclusion=${conclusion}"
-              # export outputs for workflow
-              echo "run_id=${run_id}" >> $GITHUB_OUTPUT
+            if [ "${status}" = "completed" ]; then
               echo "conclusion=${conclusion}" >> $GITHUB_OUTPUT
-              exit 0
+              break
             fi
 
-            sleep "$poll_interval"
+            sleep "${POLL_INTERVAL_SECONDS}"
           done
 
-      - name: Output direct links to remote run & artifacts
-        id: links
+      - name: Output links to remote run & artifacts
         run: |
-          run_id="${{ steps.poll.outputs.run_id }}"
-          if [ -z "$run_id" ]; then
-            echo "No run_id found in poll step outputs. The poll step may have failed or timed out."
-            exit 1
-          fi
-
+          run_id="${{ steps.findrun.outputs.run_id }}"
           remote_run_url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}"
           remote_artifacts_url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts"
 
           echo ""
-          echo "===================="
-          echo "  REMOTE RUN LINKS"
-          echo "===================="
-          echo "Remote Run URL: $remote_run_url"
+          echo "======================================"
+          echo "        REMOTE RUN LINKS"
+          echo "======================================"
+          echo "Run page: ${remote_run_url}"
           echo ""
-          echo "Artifacts URL (Allure report, zipped): $remote_artifacts_url"
-          echo "===================="
+          echo "Artifacts (Allure report): ${remote_artifacts_url}"
+          echo "======================================"
           echo ""
-
-          echo "remote_run_url=${remote_run_url}" >> $GITHUB_OUTPUT
-          echo "remote_artifacts_url=${remote_artifacts_url}" >> $GITHUB_OUTPUT
 
       - name: Fail if remote run finished but did not succeed
-        if: ${{ steps.poll.outputs.conclusion != '' && steps.poll.outputs.conclusion != 'success' }}
+        if: ${{ steps.wait.outputs.conclusion != '' && steps.wait.outputs.conclusion != 'success' }}
         run: |
-          echo "Remote workflow finished with conclusion: '${{ steps.poll.outputs.conclusion }}'. Marking as failed."
+          echo "Remote workflow finished with conclusion: '${{ steps.wait.outputs.conclusion }}'. Marking as failed."
           exit 1
 
       - name: Succeed if remote run passed
-        if: ${{ steps.poll.outputs.conclusion == 'success' }}
-        run: |
-          echo "Remote workflow succeeded (conclusion=success)."
+        if: ${{ steps.wait.outputs.conclusion == 'success' }}
+        run: echo "Remote workflow passed ✅"
