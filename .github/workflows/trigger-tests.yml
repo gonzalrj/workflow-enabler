@@ -1,4 +1,4 @@
-name: Trigger remote regression and link to report (robust run detection)
+name: Trigger remote regression and link to report (robust run detection + artifact links)
 
 on:
   push:
@@ -58,7 +58,6 @@ jobs:
           set -euo pipefail
           echo "Looking for a run created at or after $TRIGGER_TS (1s tolerance)"
 
-          # convert trigger timestamp to epoch seconds
           trigger_epoch=$(date -u -d "${TRIGGER_TS}" +%s)
           echo "trigger_epoch=${trigger_epoch}"
 
@@ -73,13 +72,10 @@ jobs:
               exit 2
             fi
 
-            # fetch recent runs
             runs_json=$(curl -sS -H "Authorization: token ${PAT}" \
               "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/workflows/${REMOTE_WORKFLOW_FILE}/runs?branch=${REMOTE_BRANCH}&per_page=30")
 
-            # iterate and pick first run whose created_at epoch >= trigger_epoch - 1
             run_id_candidate=$(echo "$runs_json" | jq -r '.workflow_runs[] | "\(.id) \(.created_at)"' | while read -r id created_at; do
-              # convert run created_at to epoch (ignore if conversion fails)
               run_epoch=$(date -u -d "${created_at}" +%s 2>/dev/null || echo 0)
               if [ "$run_epoch" -ge $(( trigger_epoch - 1 )) ]; then
                 echo "$id"
@@ -139,21 +135,64 @@ jobs:
             sleep "${POLL_INTERVAL_SECONDS}"
           done
 
-      - name: Output links to remote run & artifacts
+      - name: Resolve artifact direct download URLs and output links
+        id: artifact_links
+        env:
+          PAT: ${{ secrets.REMOTE_PAT }}
+          RUN_ID: ${{ steps.findrun.outputs.run_id }}
         run: |
-          run_id="${{ steps.findrun.outputs.run_id }}"
-          remote_run_url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}"
-          remote_artifacts_url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts"
+          set -euo pipefail
+          run_id="${RUN_ID}"
+          echo "Fetching artifacts for run ${run_id}..."
+          artifacts_json=$(curl -sS -H "Authorization: token ${PAT}" \
+            "https://api.github.com/repos/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts")
 
+          total=$(echo "$artifacts_json" | jq -r '.total_count // 0')
+          echo "Artifact total_count = $total"
+
+          if [ "$total" -eq 0 ]; then
+            echo "No artifacts found for run ${run_id}."
+            echo "remote_run_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}" >> $GITHUB_OUTPUT
+            echo "remote_artifact_urls=" >> $GITHUB_OUTPUT
+            echo "No artifacts to list."
+            exit 0
+          fi
+
+          # Build newline-separated list of artifact download URLs
+          urls=""
+          names=""
+          for row in $(echo "$artifacts_json" | jq -r '.artifacts[] | @base64'); do
+            _jq() { echo "${row}" | base64 --decode | jq -r "${1}"; }
+            id=$(_jq '.id')
+            name=$(_jq '.name')
+            url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts/${id}"
+            echo "Artifact: ${name} -> ${url}"
+            if [ -z "$urls" ]; then
+              urls="${url}"
+              names="${name}:${id}"
+            else
+              urls="${urls}\n${url}"
+              names="${names}\t${name}:${id}"
+            fi
+          done
+
+          # expose outputs (urls newline-separated, names tab-separated)
+          echo "remote_run_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}" >> $GITHUB_OUTPUT
+          # encode newlines safely for GitHub output
+          echo -e "remote_artifact_urls<<EOF\n${urls}\nEOF" >> $GITHUB_OUTPUT
+          echo "remote_artifact_names=${names}" >> $GITHUB_OUTPUT
+
+      - name: Print final summary
+        run: |
+          echo "=========================="
+          echo "REMOTE RUN SUMMARY"
+          echo "=========================="
+          echo "Run page: ${{ steps.artifact_links.outputs.remote_run_url }}"
           echo ""
-          echo "======================================"
-          echo "        REMOTE RUN LINKS"
-          echo "======================================"
-          echo "Run page: ${remote_run_url}"
-          echo ""
-          echo "Artifacts (Allure report): ${remote_artifacts_url}"
-          echo "======================================"
-          echo ""
+          echo "Artifact download URLs:"
+          # print multiline output safely
+          echo -e "${{ steps.artifact_links.outputs.remote_artifact_urls }}"
+          echo "=========================="
 
       - name: Fail if remote run finished but did not succeed
         if: ${{ steps.wait.outputs.conclusion != '' && steps.wait.outputs.conclusion != 'success' }}
