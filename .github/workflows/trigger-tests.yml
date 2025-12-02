@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Trigger remote workflow dispatch
-        uses: qa-practice-swaglabs/manual-regression-sharded.yml
+        uses: peter-evans/workflow-dispatch@v1
         with:
           token: ${{ secrets.REMOTE_PAT }}
           repository: ${{ env.REMOTE_OWNER }}/${{ env.REMOTE_REPO }}
