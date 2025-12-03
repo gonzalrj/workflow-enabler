@@ -1,4 +1,4 @@
-name: Trigger remote regression and link to report (robust run detection + artifact links)
+name: Trigger remote regression and link to consolidated artifact
 
 on:
   push:
@@ -135,11 +135,13 @@ jobs:
             sleep "${POLL_INTERVAL_SECONDS}"
           done
 
-      - name: Resolve artifact direct download URLs and output links
-        id: artifact_links
+      - name: Resolve only the consolidated (latest) artifact and output link
+        id: consolidated_artifact
         env:
           PAT: ${{ secrets.REMOTE_PAT }}
           RUN_ID: ${{ steps.findrun.outputs.run_id }}
+          REMOTE_OWNER: ${{ env.REMOTE_OWNER }}
+          REMOTE_REPO: ${{ env.REMOTE_REPO }}
         run: |
           set -euo pipefail
           run_id="${RUN_ID}"
@@ -153,45 +155,40 @@ jobs:
           if [ "$total" -eq 0 ]; then
             echo "No artifacts found for run ${run_id}."
             echo "remote_run_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}" >> $GITHUB_OUTPUT
-            echo "remote_artifact_urls=" >> $GITHUB_OUTPUT
-            echo "No artifacts to list."
+            echo "remote_artifact_url=" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Build newline-separated list of artifact download URLs
-          urls=""
-          names=""
-          for row in $(echo "$artifacts_json" | jq -r '.artifacts[] | @base64'); do
-            _jq() { echo "${row}" | base64 --decode | jq -r "${1}"; }
-            id=$(_jq '.id')
-            name=$(_jq '.name')
-            url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts/${id}"
-            echo "Artifact: ${name} -> ${url}"
-            if [ -z "$urls" ]; then
-              urls="${url}"
-              names="${name}:${id}"
-            else
-              urls="${urls}\n${url}"
-              names="${names}\t${name}:${id}"
-            fi
-          done
+          # select the artifact with the latest created_at timestamp (consolidated/latest)
+          # use jq to sort_by(created_at) and pick last
+          latest_id=$(echo "$artifacts_json" | jq -r '.artifacts | sort_by(.created_at) | .[-1].id // empty')
+          latest_name=$(echo "$artifacts_json" | jq -r '.artifacts | sort_by(.created_at) | .[-1].name // empty')
 
-          # expose outputs (urls newline-separated, names tab-separated)
+          if [ -z "$latest_id" ]; then
+            echo "Could not determine latest artifact id."
+            echo "remote_run_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}" >> $GITHUB_OUTPUT
+            echo "remote_artifact_url=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          artifact_url="https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}/artifacts/${latest_id}"
+          echo "Selected latest artifact: id=${latest_id} name=${latest_name}"
+          echo "artifact_url=${artifact_url}"
+
           echo "remote_run_url=https://github.com/${REMOTE_OWNER}/${REMOTE_REPO}/actions/runs/${run_id}" >> $GITHUB_OUTPUT
-          # encode newlines safely for GitHub output
-          echo -e "remote_artifact_urls<<EOF\n${urls}\nEOF" >> $GITHUB_OUTPUT
-          echo "remote_artifact_names=${names}" >> $GITHUB_OUTPUT
+          echo "remote_artifact_url=${artifact_url}" >> $GITHUB_OUTPUT
+          echo "remote_artifact_name=${latest_name}" >> $GITHUB_OUTPUT
 
       - name: Print final summary
         run: |
           echo "=========================="
           echo "REMOTE RUN SUMMARY"
           echo "=========================="
-          echo "Run page: ${{ steps.artifact_links.outputs.remote_run_url }}"
+          echo "Run page: ${{ steps.consolidated_artifact.outputs.remote_run_url }}"
           echo ""
-          echo "Artifact download URLs:"
-          # print multiline output safely
-          echo -e "${{ steps.artifact_links.outputs.remote_artifact_urls }}"
+          echo "Consolidated artifact name: ${{ steps.consolidated_artifact.outputs.remote_artifact_name }}"
+          echo "Consolidated artifact download URL:"
+          echo "${{ steps.consolidated_artifact.outputs.remote_artifact_url }}"
           echo "=========================="
 
       - name: Fail if remote run finished but did not succeed
@@ -202,4 +199,4 @@ jobs:
 
       - name: Succeed if remote run passed
         if: ${{ steps.wait.outputs.conclusion == 'success' }}
-        run: echo "Remote workflow passed ✅"
+        run: echo "Remote workflow passed"
